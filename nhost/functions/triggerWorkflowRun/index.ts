@@ -1,14 +1,16 @@
-export default async function handler(req: any, res: any) {
+import type { Request, Response } from "express";
+
+export default (req: Request, res: Response) => {
   if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
+    return res.status(405).json({
+      error: "Method Not Allowed",
+    });
   }
 
-  const payload = req.body || {};
-
-  console.log("triggerWorkflowRun invoked", payload);
+  console.log("triggerWorkflowRun invoked", req.body);
 
   return res.status(200).json({
     ok: true,
-    received: payload,
+    received: req.body,
   });
-}
+};
