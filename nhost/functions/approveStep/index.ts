@@ -1,8 +1,9 @@
+import type { Request, Response } from "express";
+
 type Json = Record<string, any>;
 
 const GRAPHQL_URL =
   process.env.NHOST_GRAPHQL_URL ||
-  process.env.NHOST_HASURA_URL ||
   (process.env.NHOST_SUBDOMAIN && process.env.NHOST_REGION
     ? `https://${process.env.NHOST_SUBDOMAIN}.hasura.${process.env.NHOST_REGION}.nhost.run/v1/graphql`
     : undefined);
@@ -10,52 +11,48 @@ const GRAPHQL_URL =
 const ADMIN_SECRET =
   process.env.NHOST_ADMIN_SECRET || process.env.HASURA_GRAPHQL_ADMIN_SECRET;
 
-function headers() {
-  return {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers":
-      "content-type, authorization, x-hasura-user-id, x-hasura-role",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
-}
-
-function response(status: number, body: Json) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: headers(),
-  });
-}
-
-async function gql<T = any>(
-  query: string,
-  variables?: Json
-): Promise<T> {
+async function gql<T = any>(query: string, variables?: Json): Promise<T> {
   if (!GRAPHQL_URL || !ADMIN_SECRET) {
-    throw new Error("Missing Nhost GraphQL configuration");
+    throw new Error(`Missing GraphQL config: URL=${!!GRAPHQL_URL}, SECRET=${!!ADMIN_SECRET}`);
   }
 
-  const res = await fetch(GRAPHQL_URL, {
+  const response = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-hasura-admin-secret": ADMIN_SECRET,
     },
-    body: JSON.stringify({
-      query,
-      variables,
-    }),
+    body: JSON.stringify({ query, variables }),
   });
 
-  const data = await res.json();
+  const text = await response.text();
+  let json: any;
 
-  if (!res.ok || data.errors) {
-    throw new Error(
-      JSON.stringify(data.errors || data)
-    );
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Hasura returned non-JSON: ${text}`);
   }
 
-  return data.data;
+  if (!response.ok || json.errors) {
+    throw new Error(JSON.stringify(json.errors || json));
+  }
+
+  return json.data;
+}
+
+function setCors(res: Response) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "content-type, authorization, x-hasura-user-id, x-hasura-role"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+}
+
+function sendResponse(res: Response, status: number, body: Json) {
+  setCors(res);
+  return res.status(status).json(body);
 }
 
 const GET_STEP_RUN = `
@@ -103,54 +100,40 @@ mutation UpdateWorkflowRunStatus($workflow_run_id: uuid!, $status: run_status!) 
 }
 `;
 
-export default async function handler(
-  req: Request
-): Promise<Response> {
+export default async function handler(req: Request, res: Response) {
+  setCors(res);
+
   if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: headers(),
-    });
+    return res.status(204).send();
   }
 
   if (req.method !== "POST") {
-    return response(405, {
-      ok: false,
-      message: "Method not allowed",
-    });
+    return sendResponse(res, 405, { ok: false, message: "Method not allowed" });
   }
 
   try {
-    const rawBody = await req.json().catch(() => ({}));
+    const rawBody = req.body ?? {};
+    const actionInput = rawBody?.input ?? rawBody;
 
-    // Handle both direct JSON calls and Hasura Action wrapper payloads
-    const payload = rawBody?.input ?? rawBody;
-    const step_run_id = payload?.step_run_id as string | undefined;
-    const decision = (payload?.decision || "approved") as "approved" | "rejected";
+    const step_run_id = actionInput?.step_run_id as string | undefined;
+    const decision = (actionInput?.decision || "approved") as "approved" | "rejected";
 
     if (!step_run_id) {
-      return response(400, {
-        ok: false,
-        message: "step_run_id is required",
-      });
+      return sendResponse(res, 400, { ok: false, message: "step_run_id is required" });
     }
 
-    // Extract user ID from header or Hasura Action session variables
-    const headerUserId = req.headers.get("x-hasura-user-id");
+    const headerUserId = req.headers["x-hasura-user-id"];
+    const normalizedHeaderUserId = Array.isArray(headerUserId) ? headerUserId[0] : headerUserId;
     const sessionUserId =
       rawBody?.session_variables?.["x-hasura-user-id"] ||
       rawBody?.session_variables?.["X-Hasura-User-Id"];
 
-    const userId = headerUserId || sessionUserId;
+    const userId = normalizedHeaderUserId || sessionUserId;
 
     if (!userId) {
-      return response(401, {
-        ok: false,
-        message: "Missing x-hasura-user-id header",
-      });
+      return sendResponse(res, 401, { ok: false, message: "Missing x-hasura-user-id header" });
     }
 
-    // 1. Get step run and workflow details
     const stepData = await gql<{
       step_runs_by_pk: {
         id: string;
@@ -163,20 +146,14 @@ export default async function handler(
           started_by: string;
         };
       } | null;
-    }>(GET_STEP_RUN, {
-      step_run_id,
-    });
+    }>(GET_STEP_RUN, { step_run_id });
 
     const stepRun = stepData.step_runs_by_pk;
 
     if (!stepRun) {
-      return response(404, {
-        ok: false,
-        message: "Step run not found",
-      });
+      return sendResponse(res, 404, { ok: false, message: "Step run not found" });
     }
 
-    // 2. Verify organization membership
     const membershipData = await gql<{
       org_members: Array<{
         id: string;
@@ -185,58 +162,37 @@ export default async function handler(
       }>;
     }>(
       `
-      query CheckMembership(
-        $org_id: uuid!,
-        $user_id: uuid!
-      ) {
-        org_members(
-          where: {
-            org_id: {_eq: $org_id}
-            user_id: {_eq: $user_id}
-          }
-          limit: 1
-        ) {
+      query CheckMembership($org_id: uuid!, $user_id: uuid!) {
+        org_members(where: { org_id: { _eq: $org_id }, user_id: { _eq: $user_id } }, limit: 1) {
           id
           role
           org_id
         }
       }
       `,
-      {
-        org_id: stepRun.workflow_run.org_id,
-        user_id: userId,
-      }
+      { org_id: stepRun.workflow_run.org_id, user_id: userId }
     );
 
     const membership = membershipData.org_members?.[0];
 
     if (!membership) {
-      return response(403, {
-        ok: false,
-        message: "Access denied",
-      });
+      return sendResponse(res, 403, { ok: false, message: "Access denied" });
     }
 
-    // 3. Verify owner/editor authorization
     if (!["owner", "editor"].includes(membership.role)) {
-      return response(403, {
-        ok: false,
-        message: "Only owner/editor can approve steps",
-      });
+      return sendResponse(res, 403, { ok: false, message: "Only owner/editor can approve steps" });
     }
 
-    // 4. Verify step status
     if (stepRun.status !== "pending") {
-      return response(400, {
+      return sendResponse(res, 400, {
         ok: false,
-        message: `Step cannot be approved because its current status is ${stepRun.status}`,
+        message: `Step cannot be approved because status is ${stepRun.status}`,
       });
     }
 
     const targetStepStatus = decision === "approved" ? "success" : "failed";
     const targetWorkflowStatus = decision === "approved" ? "success" : "failed";
 
-    // 5. Update step status and approval metadata
     const result = await gql<{
       update_step_runs_by_pk: {
         id: string;
@@ -249,13 +205,12 @@ export default async function handler(
       status: targetStepStatus,
     });
 
-    // 6. Update parent workflow run status
     await gql(UPDATE_WORKFLOW_RUN_STATUS, {
       workflow_run_id: stepRun.workflow_run_id,
       status: targetWorkflowStatus,
     });
 
-    return response(200, {
+    return sendResponse(res, 200, {
       ok: true,
       message: `Step ${decision} successfully`,
       step_run_id: result.update_step_runs_by_pk.id,
@@ -264,8 +219,7 @@ export default async function handler(
     });
   } catch (error: any) {
     console.error("approveStep error:", error);
-
-    return response(500, {
+    return sendResponse(res, 500, {
       ok: false,
       message: "Internal error in approveStep",
       error: error?.message || String(error),
