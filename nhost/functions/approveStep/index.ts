@@ -2,16 +2,20 @@ type Json = Record<string, any>;
 
 const GRAPHQL_URL =
   process.env.NHOST_GRAPHQL_URL ||
-  process.env.NHOST_HASURA_URL;
+  process.env.NHOST_HASURA_URL ||
+  (process.env.NHOST_SUBDOMAIN && process.env.NHOST_REGION
+    ? `https://${process.env.NHOST_SUBDOMAIN}.hasura.${process.env.NHOST_REGION}.nhost.run/v1/graphql`
+    : undefined);
 
-const ADMIN_SECRET = process.env.NHOST_ADMIN_SECRET;
+const ADMIN_SECRET =
+  process.env.NHOST_ADMIN_SECRET || process.env.HASURA_GRAPHQL_ADMIN_SECRET;
 
 function headers() {
   return {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers":
-      "content-type, authorization, x-hasura-user-id",
+      "content-type, authorization, x-hasura-user-id, x-hasura-role",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
   };
 }
@@ -71,16 +75,30 @@ query GetStepRun($step_run_id: uuid!) {
 `;
 
 const APPROVE_STEP = `
-mutation ApproveStep($step_run_id: uuid!) {
+mutation ApproveStep($step_run_id: uuid!, $approved_by: uuid!, $status: step_run_status!) {
   update_step_runs_by_pk(
     pk_columns: { id: $step_run_id }
     _set: {
-      status: approved
+      status: $status
+      approved_by: $approved_by
+      approved_at: "now()"
     }
   ) {
     id
     status
     workflow_run_id
+  }
+}
+`;
+
+const UPDATE_WORKFLOW_RUN_STATUS = `
+mutation UpdateWorkflowRunStatus($workflow_run_id: uuid!, $status: run_status!) {
+  update_workflow_runs_by_pk(
+    pk_columns: { id: $workflow_run_id }
+    _set: { status: $status }
+  ) {
+    id
+    status
   }
 }
 `;
@@ -103,10 +121,12 @@ export default async function handler(
   }
 
   try {
-    const body = await req.json().catch(() => ({}));
+    const rawBody = await req.json().catch(() => ({}));
 
-    const step_run_id =
-      body?.step_run_id as string | undefined;
+    // Handle both direct JSON calls and Hasura Action wrapper payloads
+    const payload = rawBody?.input ?? rawBody;
+    const step_run_id = payload?.step_run_id as string | undefined;
+    const decision = (payload?.decision || "approved") as "approved" | "rejected";
 
     if (!step_run_id) {
       return response(400, {
@@ -115,8 +135,13 @@ export default async function handler(
       });
     }
 
-    const userId =
-      req.headers.get("x-hasura-user-id");
+    // Extract user ID from header or Hasura Action session variables
+    const headerUserId = req.headers.get("x-hasura-user-id");
+    const sessionUserId =
+      rawBody?.session_variables?.["x-hasura-user-id"] ||
+      rawBody?.session_variables?.["X-Hasura-User-Id"];
+
+    const userId = headerUserId || sessionUserId;
 
     if (!userId) {
       return response(401, {
@@ -125,7 +150,7 @@ export default async function handler(
       });
     }
 
-    // 1. Get the step run and its workflow
+    // 1. Get step run and workflow details
     const stepData = await gql<{
       step_runs_by_pk: {
         id: string;
@@ -151,7 +176,7 @@ export default async function handler(
       });
     }
 
-    // 2. Check that the user belongs to the organization
+    // 2. Verify organization membership
     const membershipData = await gql<{
       org_members: Array<{
         id: string;
@@ -183,8 +208,7 @@ export default async function handler(
       }
     );
 
-    const membership =
-      membershipData.org_members?.[0];
+    const membership = membershipData.org_members?.[0];
 
     if (!membership) {
       return response(403, {
@@ -193,29 +217,26 @@ export default async function handler(
       });
     }
 
-    // 3. Only owner/editor can approve
-    if (
-      !["owner", "editor"].includes(
-        membership.role
-      )
-    ) {
+    // 3. Verify owner/editor authorization
+    if (!["owner", "editor"].includes(membership.role)) {
       return response(403, {
         ok: false,
-        message:
-          "Only owner/editor can approve steps",
+        message: "Only owner/editor can approve steps",
       });
     }
 
-    // 4. Only pending steps can be approved
+    // 4. Verify step status
     if (stepRun.status !== "pending") {
       return response(400, {
         ok: false,
-        message:
-          `Step cannot be approved because its current status is ${stepRun.status}`,
+        message: `Step cannot be approved because its current status is ${stepRun.status}`,
       });
     }
 
-    // 5. Approve the step
+    const targetStepStatus = decision === "approved" ? "success" : "failed";
+    const targetWorkflowStatus = decision === "approved" ? "success" : "failed";
+
+    // 5. Update step status and approval metadata
     const result = await gql<{
       update_step_runs_by_pk: {
         id: string;
@@ -224,30 +245,30 @@ export default async function handler(
       };
     }>(APPROVE_STEP, {
       step_run_id,
+      approved_by: userId,
+      status: targetStepStatus,
+    });
+
+    // 6. Update parent workflow run status
+    await gql(UPDATE_WORKFLOW_RUN_STATUS, {
+      workflow_run_id: stepRun.workflow_run_id,
+      status: targetWorkflowStatus,
     });
 
     return response(200, {
       ok: true,
-      message: "Step approved successfully",
-      step_run_id:
-        result.update_step_runs_by_pk.id,
-      status:
-        result.update_step_runs_by_pk.status,
-      workflow_run_id:
-        result.update_step_runs_by_pk.workflow_run_id,
+      message: `Step ${decision} successfully`,
+      step_run_id: result.update_step_runs_by_pk.id,
+      status: result.update_step_runs_by_pk.status,
+      workflow_run_id: result.update_step_runs_by_pk.workflow_run_id,
     });
   } catch (error: any) {
-    console.error(
-      "approveStep error:",
-      error
-    );
+    console.error("approveStep error:", error);
 
     return response(500, {
       ok: false,
       message: "Internal error in approveStep",
-      error:
-        error?.message ||
-        String(error),
+      error: error?.message || String(error),
     });
   }
 }
