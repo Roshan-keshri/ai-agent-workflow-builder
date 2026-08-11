@@ -2,15 +2,23 @@ import type { Request, Response } from "express";
 
 type Json = Record<string, any>;
 
-// Nhost env
-const HASURA_GRAPHQL_URL = process.env.NHOST_GRAPHQL_URL;
-const HASURA_ADMIN_SECRET = process.env.NHOST_ADMIN_SECRET;
+// Dynamic Nhost fallback for GraphQL endpoint & Admin Secret
+const HASURA_GRAPHQL_URL =
+  process.env.NHOST_GRAPHQL_URL ||
+  (process.env.NHOST_SUBDOMAIN && process.env.NHOST_REGION
+    ? `https://${process.env.NHOST_SUBDOMAIN}.hasura.${process.env.NHOST_REGION}.nhost.run/v1/graphql`
+    : undefined);
+
+const HASURA_ADMIN_SECRET =
+  process.env.NHOST_ADMIN_SECRET || process.env.HASURA_GRAPHQL_ADMIN_SECRET;
 
 // ---------- helpers ----------
 
 async function gql<T = any>(query: string, variables?: Json): Promise<T> {
   if (!HASURA_GRAPHQL_URL || !HASURA_ADMIN_SECRET) {
-    throw new Error("Missing NHOST_GRAPHQL_URL or NHOST_ADMIN_SECRET");
+    throw new Error(
+      `Missing GraphQL config: URL=${!!HASURA_GRAPHQL_URL}, SECRET=${!!HASURA_ADMIN_SECRET}`
+    );
   }
 
   const response = await fetch(HASURA_GRAPHQL_URL, {
@@ -59,9 +67,8 @@ query GetWorkflow($workflow_id: uuid!) {
   workflows_by_pk(id: $workflow_id) {
     id
     org_id
-    is_active
     name
-    organization: organizations {
+    organization: organization {
       id
       quota_used
       quota_allowed
@@ -96,9 +103,8 @@ mutation InsertWorkflowRun(
     object: {
       workflow_id: $workflow_id
       org_id: $org_id
-      status: running
+      status: "running"
       trigger_type: $trigger_type
-      started_by: $started_by
       input: $input
     }
   ) {
@@ -147,9 +153,6 @@ export default async function handler(req: Request, res: Response) {
   }
 
   try {
-    // Supports BOTH:
-    // 1) direct function call body: { workflow_id, trigger_type, input }
-    // 2) hasura action body: { action, input: { workflow_id, ... }, session_variables }
     const payload = req.body ?? {};
     const actionInput = payload?.input ?? payload;
 
@@ -168,7 +171,6 @@ export default async function handler(req: Request, res: Response) {
       });
     }
 
-    // user id from forwarded header OR hasura action session variables
     const headerUserId = req.headers["x-hasura-user-id"];
     const normalizedHeaderUserId = Array.isArray(headerUserId)
       ? headerUserId[0]
@@ -197,7 +199,6 @@ export default async function handler(req: Request, res: Response) {
       workflows_by_pk: {
         id: string;
         org_id: string;
-        is_active: boolean;
         name: string;
         organization: { id: string; quota_used: number; quota_allowed: number };
       } | null;
@@ -206,10 +207,6 @@ export default async function handler(req: Request, res: Response) {
     const workflow = workflowData.workflows_by_pk;
     if (!workflow) {
       return sendResponse(res, 404, { ok: false, message: "Workflow not found" });
-    }
-
-    if (!workflow.is_active) {
-      return sendResponse(res, 400, { ok: false, message: "Workflow is inactive" });
     }
 
     const membershipData = await gql<{
@@ -239,7 +236,10 @@ export default async function handler(req: Request, res: Response) {
       });
     }
 
-    if (workflow.organization.quota_used >= workflow.organization.quota_allowed) {
+    if (
+      workflow.organization &&
+      workflow.organization.quota_used >= workflow.organization.quota_allowed
+    ) {
       return sendResponse(res, 403, {
         ok: false,
         message: "Quota exceeded for this organization",
