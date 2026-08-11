@@ -103,6 +103,7 @@ mutation InsertWorkflowRun(
     object: {
       workflow_id: $workflow_id
       org_id: $org_id
+      started_by: $started_by
       status: "running"
       trigger_type: $trigger_type
       input: $input
