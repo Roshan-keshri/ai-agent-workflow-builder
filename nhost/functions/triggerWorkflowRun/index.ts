@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 
 type Json = Record<string, any>;
 
+// Nhost automatically provides these environment variables
 const HASURA_GRAPHQL_URL = process.env.NHOST_GRAPHQL_URL;
 const HASURA_ADMIN_SECRET = process.env.NHOST_ADMIN_SECRET;
 
@@ -29,7 +30,17 @@ async function gql<T = any>(
     }),
   });
 
-  const json = await response.json();
+  const text = await response.text();
+
+  let json: any;
+
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `Hasura returned non-JSON response: ${text}`
+    );
+  }
 
   if (!response.ok || json.errors) {
     throw new Error(
@@ -45,7 +56,9 @@ function sendResponse(
   status: number,
   body: Json
 ) {
-  return res.status(status).json(body);
+  return res
+    .status(status)
+    .json(body);
 }
 
 // ---------- GraphQL queries ----------
@@ -158,12 +171,16 @@ export default async function handler(
   req: Request,
   res: Response
 ) {
-  // CORS preflight
+  // ---------- CORS preflight ----------
+
   if (req.method === "OPTIONS") {
-    return res.status(204).send();
+    return res
+      .status(204)
+      .send();
   }
 
-  // Only POST is allowed
+  // ---------- Only POST is allowed ----------
+
   if (req.method !== "POST") {
     return sendResponse(res, 405, {
       ok: false,
@@ -176,18 +193,18 @@ export default async function handler(
 
     const body = req.body ?? {};
 
-    const workflow_id = body.workflow_id as
-      | string
-      | undefined;
+    const workflow_id =
+      body.workflow_id as string | undefined;
 
-    const trigger_type = (body.trigger_type ||
-      "manual") as
-      | "manual"
-      | "webhook"
-      | "scheduled"
-      | "db_event";
+    const trigger_type =
+      (body.trigger_type || "manual") as
+        | "manual"
+        | "webhook"
+        | "scheduled"
+        | "db_event";
 
-    const input = (body.input || {}) as Json;
+    const input =
+      (body.input || {}) as Json;
 
     if (!workflow_id) {
       return sendResponse(res, 400, {
@@ -201,9 +218,10 @@ export default async function handler(
     const userId =
       req.headers["x-hasura-user-id"];
 
-    const authenticatedUserId = Array.isArray(userId)
-      ? userId[0]
-      : userId;
+    const authenticatedUserId =
+      Array.isArray(userId)
+        ? userId[0]
+        : userId;
 
     if (!authenticatedUserId) {
       return sendResponse(res, 401, {
@@ -213,13 +231,13 @@ export default async function handler(
       });
     }
 
-   console.log(
-  "triggerWorkflowRun invoked",
-  {
-    workflow_id,
-    userId: authenticatedUserId,
-  }
-);
+    console.log(
+      "triggerWorkflowRun invoked",
+      {
+        workflow_id,
+        userId: authenticatedUserId,
+      }
+    );
 
     // ---------- 3. Get workflow ----------
 
@@ -349,8 +367,23 @@ export default async function handler(
     const workflowRun =
       runData.insert_workflow_runs_one;
 
+    if (!workflowRun) {
+      throw new Error(
+        "Failed to create workflow run"
+      );
+    }
+
     const workflow_run_id =
       workflowRun.id;
+
+    console.log(
+      "Workflow run created",
+      {
+        workflow_run_id,
+        workflow_id: workflow.id,
+        org_id: workflow.org_id,
+      }
+    );
 
     // ---------- 9. Get workflow steps ----------
 
@@ -375,15 +408,14 @@ export default async function handler(
 
     // ---------- 10. Create step runs ----------
 
-    const stepObjects = steps.map(
-      (step) => ({
+    const stepObjects =
+      steps.map((step) => ({
         workflow_run_id,
         workflow_step_id: step.id,
         status: "pending",
         input: {},
         attempt_count: 0,
-      })
-    );
+      }));
 
     if (stepObjects.length > 0) {
       await gql(
@@ -403,7 +435,8 @@ export default async function handler(
       workflow_run_id,
       workflow_id: workflow.id,
       org_id: workflow.org_id,
-      step_count: stepObjects.length,
+      step_count:
+        stepObjects.length,
     });
 
   } catch (error: any) {
