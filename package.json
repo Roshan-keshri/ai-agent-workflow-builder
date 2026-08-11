@@ -1,5 +1,8 @@
 {
   "devDependencies": {
     "@types/express": "^5.0.6"
+  },
+  "dependencies": {
+    "graphql-request": "^7.4.0"
   }
 }
