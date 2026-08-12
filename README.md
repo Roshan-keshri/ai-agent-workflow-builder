@@ -246,7 +246,6 @@ JOIN auth.users u ON u.id = om.user_id;
    Start Development Server:
    npm run dev
    Navigate to http://localhost:3000 to test the application locally.
-   ```
    ---
 
 ## 👤 Author & Maintainer
