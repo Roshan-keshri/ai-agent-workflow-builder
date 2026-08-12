@@ -1,0 +1,2 @@
+[auth.jwt]
+custom_claims = "public.custom_hasura_claims"
